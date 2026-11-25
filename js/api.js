@@ -15,6 +15,7 @@ const Api = (function () {
   async function call(action, params) {
     const body = { action, params: params || {}, session: session ? session.token : '' };
     let res;
+    const t0 = performance.now();
     if (demo) {
       res = await LocalApi.call(body);
     } else {
@@ -27,6 +28,9 @@ const Api = (function () {
         throw Object.assign(new Error('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่'), { code: 'NETWORK' });
       }
     }
+    const total = Math.round(performance.now() - t0);
+    // เปิด DevTools → Console ดูเวลา: total = ทั้งหมดที่ผู้ใช้รอ, server = เวลาที่ Apps Script ทำงานจริง (ส่วนต่าง = เครือข่าย/เริ่มเครื่อง)
+    console.info('[api] ' + action + ' ' + total + 'ms' + (res._ms !== undefined ? ' (server ' + res._ms + 'ms)' : ''));
     if (!res.ok) {
       if (res.error === 'AUTH') { setSession(null); window.dispatchEvent(new Event('lt-auth')); }
       throw Object.assign(new Error(res.message || 'เกิดข้อผิดพลาด'), { code: res.error });
