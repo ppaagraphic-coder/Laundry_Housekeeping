@@ -16,12 +16,12 @@ function makeSheet(name) {
   let maxRow = 0, frozen = 0, writes = 0, read = 0;
   const sh = {
     name, cells, get writes() { return writes; }, get cellsRead() { return read; },
-    getLastRow() { let m = 0; for (const k in cells) { if (cells[k] !== '' && cells[k] !== undefined) m = Math.max(m, +k.split(',')[0]); } return m; },
+    getLastRow() { sheetCalls++; let m = 0; for (const k in cells) { if (cells[k] !== '' && cells[k] !== undefined) m = Math.max(m, +k.split(',')[0]); } return m; },
     getMaxRows() { return 1000; },
     setFrozenRows(n) { frozen = n; },
     setColumnWidth() { },
     getRange(r, c, nr, nc) {
-      nr = nr || 1; nc = nc || 1;
+      nr = nr || 1; nc = nc || 1; sheetCalls++;
       const rg = {
         setValues(v) { writes++; for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) cells[(r + i) + ',' + (c + j)] = v[i][j]; return rg; },
         getValues() { read += nr * nc; const o = []; for (let i = 0; i < nr; i++) { const row = []; for (let j = 0; j < nc; j++) { const v = cells[(r + i) + ',' + (c + j)]; row.push(v === undefined ? '' : v); } o.push(row); } return o; },
@@ -43,6 +43,7 @@ function makeSheet(name) {
   return sh;
 }
 const sheets = {};
+let sheetCalls = 0;
 const ss = {
   getSheetByName: n => sheets[n] || null,
   insertSheet: n => (sheets[n] = makeSheet(n)),
@@ -56,7 +57,13 @@ const triggers = [];
 const fakes = {
   console, JSON, Date, Math, Object, Array, String, Number, Error, RegExp, isFinite, parseInt, Map, Set,
   SpreadsheetApp: { getActiveSpreadsheet: () => ss, flush() { } },
-  CacheService: { getScriptCache: () => ({ get: k => (k in cacheData ? cacheData[k] : null), put: (k, v) => { cacheData[k] = v; }, remove: k => { delete cacheData[k]; } }) },
+  CacheService: { getScriptCache: () => ({
+    get: k => (k in cacheData ? cacheData[k] : null),
+    put: (k, v) => { if (String(v).length > 100000) throw new Error('value too large'); cacheData[k] = v; },
+    remove: k => { delete cacheData[k]; },
+    getAll: ks => { const o = {}; ks.forEach(k => { if (k in cacheData) o[k] = cacheData[k]; }); return o; },
+    putAll: o => { Object.keys(o).forEach(k => { if (String(o[k]).length > 100000) throw new Error('value too large'); cacheData[k] = o[k]; }); }
+  }) },
   LockService: { getScriptLock: () => ({ waitLock() { }, releaseLock() { } }) },
   ContentService: { MimeType: { JSON: 'json' }, createTextOutput: s => ({ s, setMimeType() { return this; }, getContent() { return s; } }) },
   MailApp: { sendEmail: m => mails.push(m) },
@@ -254,6 +261,55 @@ t('login คืนข้อมูลเริ่มต้นมาในคร�
   const d = ok(post('login', { role: 'housekeeper', pin: hkPin }));
   assert.equal(d.boot.me.role, 'housekeeper');
   assert.ok(d.boot.items.length > 0 && d.boot.vendors.length > 0);
+});
+
+console.log('แคชตาราง');
+const dropTableCache = () => Object.keys(cacheData).filter(k => /^[vd]:/.test(k)).forEach(k => delete cacheData[k]);
+t('เปิดใบเดิมซ้ำ: เรียกชีตน้อยลงมาก และผลเหมือนกันทุกอย่าง', () => {
+  dropTableCache();
+  let c = sheetCalls; const a = ok(post('getSlip', { doc_no: doc }, hk)); const cold = sheetCalls - c;
+  c = sheetCalls; const b = ok(post('getSlip', { doc_no: doc }, hk)); const warm = sheetCalls - c;
+  assert.deepEqual(b, a, 'ผลจากแคชต้องเหมือนอ่านจากชีต');
+  assert.ok(warm * 4 <= cold, 'อ่านซ้ำเรียกชีต ' + warm + ' ครั้ง เทียบครั้งแรก ' + cold);
+  console.log('      (ครั้งแรก ' + cold + ' ครั้ง → ครั้งต่อไป ' + warm + ' ครั้ง)');
+});
+t('แก้ข้อมูลแล้วอ่านใหม่ต้องเห็นของใหม่ทันที (ไม่ค้างแคชเก่า)', () => {
+  ok(post('getSlip', { doc_no: doc }, adm));                  // อุ่นแคช
+  const cur = ok(post('getSlip', { doc_no: doc }, adm));
+  const lines = cur.lines.map(l => ({ item_seq: l.item_seq, z: [l.z1, l.z2, l.z3, l.z4, l.z5, l.z6], note: l.note }));
+  lines.find(l => l.item_seq === 7).z[5] = 9;
+  ok(post('adminEdit', { doc_no: doc, reason: 'ทดสอบแคช', lines }, adm));
+  const after = ok(post('getSlip', { doc_no: doc }, adm));
+  assert.equal(after.lines.find(l => l.item_seq === 7).z6, 9);
+  assert.ok(after.revisions.some(r => r.reason === 'ทดสอบแคช'));
+  assert.ok(ok(post('listSlips', {}, hk)).slips.length >= 1);
+});
+t('ตารางใหญ่แบ่งเป็นหลายชิ้นแล้วประกอบกลับได้ถูกต้อง', () => {
+  vm.runInContext('CHUNK = 300', ctx);
+  try {
+    dropTableCache();
+    const a = ok(post('getSlip', { doc_no: doc }, hk));
+    assert.ok(Object.keys(cacheData).filter(k => /^d:/.test(k)).some(k => /:[1-9]\d*$/.test(k)), 'ควรมีหลายชิ้น');
+    const b = ok(post('getSlip', { doc_no: doc }, hk));
+    assert.deepEqual(b, a);
+  } finally { vm.runInContext('CHUNK = 30000', ctx); dropTableCache(); }
+});
+t('แคชหาย/หมดอายุกลางทางก็ยังทำงานถูก (กลับไปอ่านชีต)', () => {
+  const a = ok(post('dashboard', {}, adm));
+  dropTableCache();
+  assert.deepEqual(ok(post('dashboard', {}, adm)).counts, a.counts);
+});
+t('Users ไม่แคช: เปลี่ยน PIN ในชีตแล้วมีผลทันที', () => {
+  const old = sheets.Users.cells['3,3'];
+  ok(post('login', { role: 'housekeeper', pin: String(old) }));
+  sheets.Users.cells['3,3'] = '654321';
+  assert.equal(post('login', { role: 'housekeeper', pin: String(old) }).ok, false);
+  ok(post('login', { role: 'housekeeper', pin: '654321' }));
+  sheets.Users.cells['3,3'] = old;
+});
+t('ตอบกลับมีเวลาที่เซิร์ฟเวอร์ใช้ (_ms) ไว้ดูว่าช้าที่ไหน', () => {
+  const r = post('bootstrap', {}, hk);
+  assert.equal(typeof r._ms, 'number');
 });
 
 console.log('\n' + (process.exitCode ? 'มีข้อที่ไม่ผ่าน' : 'ผ่านทั้งหมด ' + pass + ' ข้อ'));
