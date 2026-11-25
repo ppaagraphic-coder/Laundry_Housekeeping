@@ -323,8 +323,7 @@ const Core = (function () {
     [slip.sender_sig, slip.vendor_sig].forEach(i => { if (i) ids[i] = 1; });
     receipts.forEach(r => { if (r.receiver_sig) ids[r.receiver_sig] = 1; });
     shortages.forEach(r => { if (r.ack_sig) ids[r.ack_sig] = 1; });
-    const sigs = {};
-    if (Object.keys(ids).length) store.all('Signatures').forEach(s => { if (ids[s.sig_id]) sigs[s.sig_id] = s.png; });
+    const sigs = sigPngs(store, ids);
 
     const used = {};
     lines.forEach(l => { used[l.item_seq] = 1; });
@@ -354,6 +353,15 @@ const Core = (function () {
   function safeJSON(s, d) { try { return JSON.parse(s); } catch (e) { return d; } }
 
   // ---------- ตรวจและเขียนข้อมูล ----------
+  // อ่านภาพลายเซ็นเฉพาะรหัสที่ต้องใช้ (ไม่ดึงทั้งตาราง — ภาพ PNG หนักและโตตามการใช้งาน)
+  function sigPngs(store, idMap) {
+    const want = Object.keys(idMap);
+    if (!want.length) return {};
+    if (store.pickSigs) return store.pickSigs(want);
+    const out = {};
+    store.all('Signatures').forEach(s => { if (idMap[s.sig_id]) out[s.sig_id] = s.png; });
+    return out;
+  }
   function sigOk(png) {
     return typeof png === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(png) && png.length > 300 && png.length < 48000;
   }
@@ -505,7 +513,7 @@ const Core = (function () {
     store.kv.remove(lockKey);
     const token = uid(32);
     store.kv.put('s:' + token, JSON.stringify({ role: u.role, name: u.name }), 6 * 3600);
-    return { session: token, role: u.role, name: u.name };
+    return { session: token, role: u.role, name: u.name, boot: H.bootstrap(store, {}, { role: u.role, name: u.name }) };
   };
 
   H.logout = function (store, p) { if (p.session) store.kv.remove('s:' + p.session); return {}; };
@@ -924,8 +932,7 @@ const Core = (function () {
     lines.forEach(l => { used[l.item_seq] = 1; });
     const items = itemsAll(store).filter(i => i.active || used[i.seq]).map(i => ({ seq: i.seq, name: i.name }));
     const c = cfg(store);
-    const sigs = {};
-    if (col.sig_id) store.all('Signatures').forEach(x => { if (x.sig_id === col.sig_id) sigs[x.sig_id] = x.png; });
+    const sigs = col.sig_id ? sigPngs(store, { [col.sig_id]: 1 }) : {};
     return {
       col, lines, items, zones: zonesOf(c), sigs, status_label: COL_STATUS[col.status] || col.status,
       hotel: { name: c.hotel_name, line1: c.hotel_line1, line2: c.hotel_line2, line3: c.hotel_line3 },

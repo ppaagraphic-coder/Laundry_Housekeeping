@@ -105,7 +105,8 @@ SheetStore_.prototype.all = function (t) {
 SheetStore_.prototype.insertMany = function (t, objs) {
   if (!objs.length) return;
   this.flushTable_(t);
-  var c = this.load_(t);
+  // ไม่ต้องอ่านทั้งตารางก่อนเขียน: ถ้าตารางนี้ยังไม่เคยถูกโหลดในคำสั่งนี้ ก็แค่ต่อท้ายแถวในชีต
+  var c = this.cache[t] || null;
   var sh = this.sheet_(t);
   var cols = this.cols_(t);
   var start = sh.getLastRow() + 1;
@@ -113,13 +114,29 @@ SheetStore_.prototype.insertMany = function (t, objs) {
   sh.getRange(start, 1, rows.length, cols.length).setValues(rows.map(function (r) {
     return cols.map(function (k) { return r[k]; });
   }));
-  for (var i = 0; i < rows.length; i++) { c.rows.push(rows[i]); c.idx.push(start + i); }
+  if (c) for (var i = 0; i < rows.length; i++) { c.rows.push(rows[i]); c.idx.push(start + i); }
+  return rows;
 };
 
 SheetStore_.prototype.insert = function (t, o) {
-  this.insertMany(t, [o]);
-  var rows = this.load_(t).rows;
-  return Object.assign({}, rows[rows.length - 1]);
+  var rows = this.insertMany(t, [o]);
+  return Object.assign({}, rows[0]);
+};
+
+// อ่านภาพลายเซ็นเฉพาะรหัสที่ขอ: อ่านคอลัมน์ sig_id คอลัมน์เดียว แล้วดึงเฉพาะแถวที่ตรง (ไม่อ่าน PNG ทั้งตาราง)
+SheetStore_.prototype.pickSigs = function (ids) {
+  var sh = this.sheet_('Signatures');
+  var last = sh.getLastRow();
+  var out = {};
+  if (last < 2) return out;
+  var want = {};
+  ids.forEach(function (i) { want[i] = 1; });
+  var col = sh.getRange(2, 1, last - 1, 1).getValues();
+  for (var i = 0; i < col.length; i++) {
+    var id = String(col[i][0]);
+    if (want[id]) out[id] = String(sh.getRange(i + 2, 6, 1, 1).getValues()[0][0] || '');
+  }
+  return out;
 };
 
 function matches_(r, m) {
