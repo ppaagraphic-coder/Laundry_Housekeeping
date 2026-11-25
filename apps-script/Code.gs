@@ -12,6 +12,13 @@ var TIMEZONE = 'Asia/Bangkok';
 // คำสั่งที่ "อ่านอย่างเดียว" ไม่ต้องล็อกคิว (คำสั่งอื่นจะเข้าคิวทีละคำสั่งเพื่อกันข้อมูลชนกัน)
 var READ_ONLY = { bootstrap: 1, listSlips: 1, getSlip: 1, vendorGet: 1, dashboard: 1, login: 1, logout: 1, report: 1, listCollections: 1, getCollection: 1, pendingCollections: 1 };
 
+// แคชตาราง (CacheService): อ่านเร็วกว่าอ่านชีตมาก ล้างทันทีที่แอปเขียนตารางนั้น
+// หมายเหตุ: ถ้าแก้ข้อมูลในชีตด้วยมือโดยตรง เว็บจะเห็นการเปลี่ยนแปลงภายใน CACHE_TTL วินาที (Users ไม่แคช จึงเปลี่ยน PIN ได้ทันที)
+var CACHE_TTL = 300;
+var CHUNK = 30000;       // ตัวอักษรต่อชิ้น (ไทย 3 ไบต์/ตัว → ไม่เกินเพดาน 100KB ต่อค่า)
+var MAX_CHUNKS = 40;     // ตารางใหญ่เกินนี้ไม่แคช (อ่านจากชีตตรงๆ)
+var NO_CACHE = { Users: 1, Signatures: 1 };
+
 // ---------------------------------------------------------------- Web app
 function doGet() {
   return json_({ ok: true, name: 'linen-tracker', version: Core.VERSION });
@@ -26,6 +33,7 @@ function doPost(e) {
   }
   var lock = null;
   var store = null;
+  var t0 = Date.now();
   try {
     if (!READ_ONLY[req.action]) {
       lock = LockService.getScriptLock();
@@ -34,10 +42,12 @@ function doPost(e) {
     store = new SheetStore_(SpreadsheetApp.getActiveSpreadsheet());
     var res = Core.handle(store, req, { notify: notifyAdmin_, mail: sendMail_ });
     store.flush();
+    res._ms = Date.now() - t0;
     return json_(res);
   } catch (err) {
     return json_({ ok: false, error: 'SERVER', message: 'ระบบขัดข้อง: ' + (err && err.message ? err.message : err) });
   } finally {
+    if (store) { try { store.invalidate(); } catch (e2) { /* แคชเป็นส่วนเสริม */ } }
     if (lock) lock.releaseLock();
   }
 }
@@ -60,6 +70,9 @@ function SheetStore_(ss) {
   this.ss = ss;
   this.cache = {};   // table -> { rows: [obj], idx: [sheetRow] }
   this.dirty = {};   // table -> { sheetRow: true }
+  this.touched = {}; // ตารางที่คำสั่งนี้เขียน (ใช้ล้างแคชตอนจบ)
+  this.sigMemo = {}; // ภาพลายเซ็นที่รู้แล้วในคำสั่งนี้ (ไม่ต้องอ่านซ้ำ)
+  this.lastRow = {}; // เลขแถวสุดท้ายที่เขียนเอง (ไม่ต้องถาม getLastRow ซ้ำ)
   var self = this;
   this.kv = {
     get: function (k) { return CacheService.getScriptCache().get(k); },
@@ -75,8 +88,89 @@ function SheetStore_(ss) {
 
 SheetStore_.prototype.cols_ = function (t) { return Core.SCHEMA[t].map(function (c) { return c[0]; }); };
 
+function cacheSvc_() { return CacheService.getScriptCache(); }
+
+// เลขเวอร์ชันของแต่ละตาราง (เปลี่ยนทุกครั้งที่เขียน → แคชเก่าใช้ไม่ได้ทันที)
+SheetStore_.prototype.versions_ = function () {
+  if (this.ver) return this.ver;
+  var tables = Object.keys(Core.SCHEMA).filter(function (t) { return !NO_CACHE[t]; });
+  var got = cacheSvc_().getAll(tables.map(function (t) { return 'v:' + t; })) || {};
+  var ver = {}, put = {}, any = false;
+  tables.forEach(function (t) {
+    var v = got['v:' + t];
+    if (!v) { v = Utilities.getUuid().slice(0, 8); put['v:' + t] = v; any = true; }
+    ver[t] = v;
+  });
+  if (any) cacheSvc_().putAll(put, 21600);
+  this.ver = ver;
+  return ver;
+};
+
+SheetStore_.prototype.cacheGet_ = function (t) {
+  if (NO_CACHE[t]) return null;
+  try {
+    var base = 'd:' + t + ':' + this.versions_()[t] + ':';
+    var svc = cacheSvc_();
+    var first = svc.get(base + '0');
+    if (!first) return null;
+    var bar = first.indexOf('|');
+    var n = Number(first.slice(0, bar));
+    var parts = [first.slice(bar + 1)];
+    if (n > 1) {
+      var keys = [];
+      for (var i = 1; i < n; i++) keys.push(base + i);
+      var got = svc.getAll(keys) || {};
+      for (var j = 1; j < n; j++) {
+        if (got[base + j] === undefined || got[base + j] === null) return null;
+        parts.push(got[base + j]);
+      }
+    }
+    var o = JSON.parse(parts.join(''));
+    return { rows: o.r, idx: o.i };
+  } catch (e) { return null; }
+};
+
+SheetStore_.prototype.cachePut_ = function (t, c, ver) {
+  if (NO_CACHE[t]) return;
+  try {
+    var s = JSON.stringify({ r: c.rows, i: c.idx });
+    var n = Math.max(1, Math.ceil(s.length / CHUNK));
+    if (n > MAX_CHUNKS) return;
+    var base = 'd:' + t + ':' + ver + ':';
+    var put = {};
+    for (var i = 0; i < n; i++) {
+      var part = s.slice(i * CHUNK, (i + 1) * CHUNK);
+      put[base + i] = i === 0 ? n + '|' + part : part;
+    }
+    cacheSvc_().putAll(put, CACHE_TTL);
+  } catch (e) { /* แคชเต็ม/ผิดพลาด: ข้ามไป ระบบยังทำงานปกติจากชีต */ }
+};
+
+// ทำเครื่องหมายตารางที่ถูกเขียน แล้วเปลี่ยนเวอร์ชันตอนท้ายคำสั่ง (เรียกเสมอ แม้คำสั่งล้มเหลวกลางทาง)
+SheetStore_.prototype.touch_ = function (t) { this.touched[t] = 1; };
+SheetStore_.prototype.invalidate = function () {
+  if (this.touched.Signatures) {
+    var sp = {}, self = this;
+    Object.keys(this.sigMemo).forEach(function (id) { if (self.sigMemo[id]) sp['sig:' + id] = self.sigMemo[id]; });
+    try { if (Object.keys(sp).length) cacheSvc_().putAll(sp, 3600); } catch (e) { /* ข้าม */ }
+  }
+  var put = {}, any = false;
+  for (var t in this.touched) {
+    if (NO_CACHE[t]) continue;
+    put['v:' + t] = Utilities.getUuid().slice(0, 8);
+    any = true;
+  }
+  this.touched = {};
+  if (any) cacheSvc_().putAll(put, 21600);
+};
+
 SheetStore_.prototype.load_ = function (t) {
   if (this.cache[t]) return this.cache[t];
+  // ตารางที่คำสั่งนี้เพิ่งเขียน ต้องอ่านจากชีตเสมอ (เวอร์ชันแคชเพิ่งเปลี่ยนตอนท้ายคำสั่ง จึงยังชี้ข้อมูลเก่า)
+  var written = !!(this.touched && this.touched[t]);
+  var hit = written ? null : this.cacheGet_(t);
+  if (hit) { this.cache[t] = hit; return hit; }
+  var verAtRead = (NO_CACHE[t] || written) ? null : this.versions_()[t];   // อ่านเวอร์ชันก่อนอ่านชีตเสมอ (กันแคชเก่าค้าง)
   var sh = this.sheet_(t);
   var schema = Core.SCHEMA[t];
   var last = sh.getLastRow();
@@ -95,6 +189,7 @@ SheetStore_.prototype.load_ = function (t) {
     }
   }
   this.cache[t] = { rows: rows, idx: idx };
+  if (verAtRead) this.cachePut_(t, this.cache[t], verAtRead);
   return this.cache[t];
 };
 
@@ -107,13 +202,17 @@ SheetStore_.prototype.insertMany = function (t, objs) {
   this.flushTable_(t);
   // ไม่ต้องอ่านทั้งตารางก่อนเขียน: ถ้าตารางนี้ยังไม่เคยถูกโหลดในคำสั่งนี้ ก็แค่ต่อท้ายแถวในชีต
   var c = this.cache[t] || null;
+  if (!c && !this.touched[t]) { var hit = this.cacheGet_(t); if (hit) { this.cache[t] = hit; c = hit; } }
+  this.touch_(t);
   var sh = this.sheet_(t);
   var cols = this.cols_(t);
-  var start = sh.getLastRow() + 1;
+  var start = (this.lastRow[t] || sh.getLastRow()) + 1;
   var rows = objs.map(function (o) { return Core.row(t, o); });
   sh.getRange(start, 1, rows.length, cols.length).setValues(rows.map(function (r) {
     return cols.map(function (k) { return r[k]; });
   }));
+  this.lastRow[t] = start + rows.length - 1;
+  if (t === 'Signatures') rows.forEach(function (r) { this.sigMemo[r.sig_id] = r.png; }, this);
   if (c) for (var i = 0; i < rows.length; i++) { c.rows.push(rows[i]); c.idx.push(start + i); }
   return rows;
 };
@@ -125,17 +224,34 @@ SheetStore_.prototype.insert = function (t, o) {
 
 // อ่านภาพลายเซ็นเฉพาะรหัสที่ขอ: อ่านคอลัมน์ sig_id คอลัมน์เดียว แล้วดึงเฉพาะแถวที่ตรง (ไม่อ่าน PNG ทั้งตาราง)
 SheetStore_.prototype.pickSigs = function (ids) {
+  var out = {}, miss = [], self = this;
+  ids.forEach(function (id) { if (self.sigMemo[id] !== undefined) out[id] = self.sigMemo[id]; else miss.push(id); });
+  if (!miss.length) return out;
+  // 1) แคชรายใบ (ลายเซ็นบันทึกแล้วไม่เปลี่ยน จึงไม่ต้องล้าง)
+  try {
+    var got = cacheSvc_().getAll(miss.map(function (id) { return 'sig:' + id; })) || {};
+    var still = [];
+    miss.forEach(function (id) { var v = got['sig:' + id]; if (v) { out[id] = self.sigMemo[id] = v; } else still.push(id); });
+    miss = still;
+  } catch (e) { /* ข้ามไปอ่านจากชีต */ }
+  if (!miss.length) return out;
+  // 2) อ่านจากชีต: คอลัมน์ sig_id คอลัมน์เดียว แล้วดึงเฉพาะแถวที่ตรง
   var sh = this.sheet_('Signatures');
   var last = sh.getLastRow();
-  var out = {};
   if (last < 2) return out;
   var want = {};
-  ids.forEach(function (i) { want[i] = 1; });
+  miss.forEach(function (i) { want[i] = 1; });
   var col = sh.getRange(2, 1, last - 1, 1).getValues();
+  var found = {};
   for (var i = 0; i < col.length; i++) {
     var id = String(col[i][0]);
-    if (want[id]) out[id] = String(sh.getRange(i + 2, 6, 1, 1).getValues()[0][0] || '');
+    if (want[id]) {
+      var png = String(sh.getRange(i + 2, 6, 1, 1).getValues()[0][0] || '');
+      out[id] = self.sigMemo[id] = png;
+      if (png) found['sig:' + id] = png;
+    }
   }
+  try { if (Object.keys(found).length) cacheSvc_().putAll(found, 3600); } catch (e) { /* แคชเต็ม: ข้าม */ }
   return out;
 };
 
@@ -148,6 +264,7 @@ SheetStore_.prototype.update = function (t, m, patch) {
   var c = this.load_(t);
   var p = Core.rowPatch(t, patch);
   var n = 0;
+  this.touch_(t);
   this.dirty[t] = this.dirty[t] || {};
   for (var i = 0; i < c.rows.length; i++) {
     if (matches_(c.rows[i], m)) {
@@ -183,6 +300,8 @@ SheetStore_.prototype.flushTable_ = function (t) {
 SheetStore_.prototype.deleteWhere = function (t, m) {
   this.flushTable_(t);
   var c = this.load_(t);
+  this.touch_(t);
+  delete this.lastRow[t];
   var sh = this.sheet_(t);
   var del = [];
   for (var i = 0; i < c.rows.length; i++) if (matches_(c.rows[i], m)) del.push(c.idx[i]);
@@ -215,6 +334,7 @@ function setup() {
   var adminPin = randomPin_(), hkPin = randomPin_();
   Core.seed(store, { adminPin: adminPin, hkPin: hkPin });
   store.flush();
+  store.invalidate();
   var blank = ss.getSheetByName('Sheet1') || ss.getSheetByName('ชีต1');
   if (blank && blank.getLastRow() === 0 && ss.getSheets().length > 1) ss.deleteSheet(blank);
   ensureDailyTrigger_();
