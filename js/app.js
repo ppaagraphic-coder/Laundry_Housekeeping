@@ -17,7 +17,7 @@ const App = (function () {
       e.preventDefault();
       if (!role) { err.textContent = 'เลือกบทบาทก่อน'; err.classList.remove('hide'); return; }
       UI.busy(go, async () => {
-        try { await Api.login(role, pin.value); err.classList.add('hide'); location.hash = '#/'; start(); }
+        try { const d = await Api.login(role, pin.value); err.classList.add('hide'); location.hash = '#/'; start(d.boot); }
         catch (x) { err.textContent = UI.errMsg(x); err.classList.remove('hide'); pin.value = ''; pin.focus(); }
       });
     } }, [
@@ -76,7 +76,7 @@ const App = (function () {
     window.scrollTo(0, 0);
   }
 
-  function start() { state.boot = null; render(); }
+  function start(boot) { state.boot = boot || null; render(); }
   window.addEventListener('hashchange', () => { render(); });
   window.addEventListener('lt-auth', () => { state.boot = null; loginPage(); });
   start();

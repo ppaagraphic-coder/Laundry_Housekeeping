@@ -2,5 +2,5 @@
 window.APP_CONFIG = {
   // URL ของ Google Apps Script Web app (ลงท้ายด้วย /exec)
   // เว้นว่าง "" = โหมดทดลอง: ข้อมูลเก็บในเบราว์เซอร์เครื่องนี้เท่านั้น (ใช้ลองกดดูก่อนเชื่อม Google Sheet)
-  API_URL: 'https://script.google.com/macros/s/AKfycbycZQ4svKEn_oXLM3yIeiyf1VuWDzzjHkYYGhkFSUbkwRIKzvchSC8BsidAlTQJJyQ/exec'
+  API_URL: 'https://script.google.com/macros/s/AKfycbwLRyK1USyGmKAO0hYDintaCD3YmihNqzpBXcgv4E7PJ-Np32YJVBBZ2Ph6WOTobtzE/exec'
 };
