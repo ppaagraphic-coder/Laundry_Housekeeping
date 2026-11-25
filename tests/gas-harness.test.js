@@ -13,9 +13,9 @@ assert.equal(coreGs, fs.readFileSync(path.join(root, 'js/core.js'), 'utf8'), 'Co
 // ---------- Google Apps Script ปลอม ----------
 function makeSheet(name) {
   const cells = {}; // "r,c" -> value
-  let maxRow = 0, frozen = 0, writes = 0;
+  let maxRow = 0, frozen = 0, writes = 0, read = 0;
   const sh = {
-    name, cells, get writes() { return writes; },
+    name, cells, get writes() { return writes; }, get cellsRead() { return read; },
     getLastRow() { let m = 0; for (const k in cells) { if (cells[k] !== '' && cells[k] !== undefined) m = Math.max(m, +k.split(',')[0]); } return m; },
     getMaxRows() { return 1000; },
     setFrozenRows(n) { frozen = n; },
@@ -24,7 +24,7 @@ function makeSheet(name) {
       nr = nr || 1; nc = nc || 1;
       const rg = {
         setValues(v) { writes++; for (let i = 0; i < nr; i++) for (let j = 0; j < nc; j++) cells[(r + i) + ',' + (c + j)] = v[i][j]; return rg; },
-        getValues() { const o = []; for (let i = 0; i < nr; i++) { const row = []; for (let j = 0; j < nc; j++) { const v = cells[(r + i) + ',' + (c + j)]; row.push(v === undefined ? '' : v); } o.push(row); } return o; },
+        getValues() { read += nr * nc; const o = []; for (let i = 0; i < nr; i++) { const row = []; for (let j = 0; j < nc; j++) { const v = cells[(r + i) + ',' + (c + j)]; row.push(v === undefined ? '' : v); } o.push(row); } return o; },
         setFontWeight() { return rg; }, setBackground() { return rg; }, setNumberFormat() { return rg; }
       };
       return rg;
@@ -224,6 +224,36 @@ t('report รายวัน/เดือน/ปี อ่านข้อมู�
   const d = ok(post('report', { type: 'day', key: '2026-11-25' }, adm));
   assert.equal(typeof d.errors.total, 'number');
   assert.equal(post('report', { type: 'day' }, hk).error, 'FORBIDDEN');
+});
+
+console.log('ความเร็ว: ไม่อ่านข้อมูลหนักเกินจำเป็น');
+t('เปิดใบส่งผ้าไม่ดึงภาพลายเซ็นทั้งตาราง แต่ยังได้ลายเซ็นของใบนั้นครบ', () => {
+  const rows = sheets.Signatures.getLastRow() - 1;
+  assert.ok(rows >= 8, 'ต้องมีลายเซ็นหลายใบจึงจะวัดได้');
+  const before = sheets.Signatures.cellsRead;
+  const v = ok(post('getSlip', { doc_no: doc }, hk));
+  const used = sheets.Signatures.cellsRead - before;
+  assert.ok(Object.keys(v.signatures || v.sigs || {}).length >= 3, 'ลายเซ็นของใบนี้ต้องยังอยู่ครบ');
+  assert.ok(used < rows * 6, 'อ่าน ' + used + ' เซลล์ ต้องน้อยกว่าอ่านทั้งตาราง ' + rows * 6);
+});
+t('insert ลง Log/Signatures ไม่ต้องอ่านทั้งตารางก่อนเขียน (และแถวใหม่ยังอยู่ครบ)', () => {
+  const Store = run('SheetStore_');
+  const st = new Store(ss);
+  const logB = sheets.Log.cellsRead, sigB = sheets.Signatures.cellsRead, logRows = sheets.Log.getLastRow();
+  const r = st.insert('Log', { at: '2026-11-26T09:00:00+07:00', actor: 'ทดสอบ', role: 'admin', action: 'edit', doc_no: 'X', detail: 'd', notify: 0 });
+  st.insert('Signatures', { sig_id: 'SGTEST', doc_no: 'X', role: 'admin', name: 'ทดสอบ', at: '2026-11-26T09:00:00+07:00', png: SIG });
+  assert.equal(sheets.Log.cellsRead - logB, 0, 'Log ไม่ควรถูกอ่านตอน insert');
+  assert.equal(sheets.Signatures.cellsRead - sigB, 0, 'Signatures ไม่ควรถูกอ่านตอน insert');
+  assert.equal(sheets.Log.getLastRow(), logRows + 1);
+  assert.equal(r.actor, 'ทดสอบ');
+  // โหลดทีหลังต้องเห็นแถวที่เพิ่งเพิ่ม (แคชไม่เพี้ยน)
+  assert.ok(st.all('Log').some(x => x.actor === 'ทดสอบ'));
+  assert.equal(st.pickSigs(['SGTEST']).SGTEST, SIG);
+});
+t('login คืนข้อมูลเริ่มต้นมาในครั้งเดียว (ไม่ต้องเรียก bootstrap ซ้ำ)', () => {
+  const d = ok(post('login', { role: 'housekeeper', pin: hkPin }));
+  assert.equal(d.boot.me.role, 'housekeeper');
+  assert.ok(d.boot.items.length > 0 && d.boot.vendors.length > 0);
 });
 
 console.log('\n' + (process.exitCode ? 'มีข้อที่ไม่ผ่าน' : 'ผ่านทั้งหมด ' + pass + ' ข้อ'));
